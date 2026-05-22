@@ -8,6 +8,13 @@
 // pings to the router's link-local address, but only on the wired interface,
 // so the wifi radio isn't burning air time when it isn't carrying traffic.
 //
+// In addition to the periodic probe, dualpinet subscribes to RTNETLINK
+// link notifications and reacts immediately to carrier changes on the
+// wired interface: loss of carrier fails over to wifi at once, and a
+// fresh carrier triggers a fast-probe window that returns to the wired
+// path on the first successful ping rather than waiting for the slow
+// success streak.
+//
 // Usage:
 //
 //	dualpinet --ip 10.0.0.32/16
@@ -33,6 +40,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/jsimonetti/rtnetlink"
+	"github.com/mdlayher/netlink"
 )
 
 var (
@@ -45,6 +55,12 @@ const (
 	probeTimeout        = 1 * time.Second
 	failsBeforeFailover = 3 // ~6s of dead primary before flipping to secondary
 	goodsBeforeFailback = 5 // ~10s of live primary before flipping back
+
+	// fastProbeWindow is how long we probe at fastProbeInterval after the
+	// primary's carrier returns, so we fail back on the first successful
+	// ping rather than waiting for the slow goodsBeforeFailback streak.
+	fastProbeInterval = 250 * time.Millisecond
+	fastProbeWindow   = 10 * time.Second
 )
 
 func main() {
@@ -168,9 +184,14 @@ type controller struct {
 	primary   *net.Interface
 	secondary *net.Interface
 
-	current    string // interface name currently holding ip, or "" if unassigned
-	goodStreak int
-	badStreak  int
+	current        string // interface name currently holding ip, or "" if unassigned
+	goodStreak     int
+	badStreak      int
+	fastProbeUntil time.Time // probe at fastProbeInterval until this time
+}
+
+func (c *controller) inFastMode() bool {
+	return !c.fastProbeUntil.IsZero() && time.Now().Before(c.fastProbeUntil)
 }
 
 func run(ctx context.Context, ip netip.Prefix, router netip.Addr, primary, secondary *net.Interface) {
@@ -179,17 +200,65 @@ func run(ctx context.Context, ip netip.Prefix, router netip.Addr, primary, secon
 	if c.current != "" {
 		log.Printf("found %s already on %s; adopting", ip, c.current)
 	}
-	t := time.NewTicker(probeInterval)
-	defer t.Stop()
+
+	events := make(chan linkEvent, 16)
+	go watchLinks(ctx, events)
+
 	c.tick(ctx)
+	var wasFast bool
 	for {
+		nowFast := c.inFastMode()
+		if wasFast && !nowFast && c.current != c.primary.Name {
+			log.Printf("fast-probe window expired; %s still unreachable, back to %s polling",
+				c.primary.Name, probeInterval)
+		}
+		wasFast = nowFast
+
+		d := probeInterval
+		if nowFast {
+			d = fastProbeInterval
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-time.After(d):
 			c.tick(ctx)
+		case ev := <-events:
+			if ev.name != c.primary.Name && ev.name != c.secondary.Name {
+				continue
+			}
+			log.Printf("netlink: %s carrier=%v", ev.name, ev.up)
+			if ev.name == c.primary.Name {
+				c.handleLinkEvent(ctx, ev)
+			}
 		}
 	}
+}
+
+func (c *controller) handleLinkEvent(ctx context.Context, ev linkEvent) {
+	if !ev.up {
+		if c.current == c.secondary.Name {
+			log.Printf("(already on %s, no-op)", c.secondary.Name)
+			return
+		}
+		log.Printf("link DOWN on %s; immediate failover to %s", ev.name, c.secondary.Name)
+		if err := c.apply(c.secondary.Name); err != nil {
+			log.Printf("apply: %v", err)
+			return
+		}
+		c.current = c.secondary.Name
+		c.badStreak = failsBeforeFailover
+		c.goodStreak = 0
+		c.fastProbeUntil = time.Time{}
+		return
+	}
+	if c.current == c.primary.Name {
+		log.Printf("(already on %s, no-op)", c.primary.Name)
+		return
+	}
+	log.Printf("link UP on %s; fast-probing for up to %s", ev.name, fastProbeWindow)
+	c.fastProbeUntil = time.Now().Add(fastProbeWindow)
+	c.tick(ctx)
 }
 
 // detectExisting returns the name of whichever managed interface currently
@@ -244,6 +313,8 @@ func (c *controller) tick(ctx context.Context) {
 		want = c.secondary.Name
 	case c.current == c.primary.Name && c.badStreak >= failsBeforeFailover:
 		want = c.secondary.Name
+	case c.current == c.secondary.Name && state == probeAlive && c.inFastMode():
+		want = c.primary.Name
 	case c.current == c.secondary.Name && c.goodStreak >= goodsBeforeFailback:
 		want = c.primary.Name
 	}
@@ -261,6 +332,9 @@ func (c *controller) tick(ctx context.Context) {
 		return
 	}
 	c.current = want
+	if want == c.primary.Name {
+		c.fastProbeUntil = time.Time{}
+	}
 }
 
 type probeState int
@@ -356,6 +430,69 @@ func hasCarrier(iface string) (bool, error) {
 		return false, err
 	}
 	return strings.TrimSpace(string(data)) == "1", nil
+}
+
+// linkEvent is one RTM_NEWLINK/DELLINK notification, distilled to the
+// fields dualpinet needs: which interface, and whether L1 carrier is up.
+type linkEvent struct {
+	name string
+	up   bool
+}
+
+// watchLinks streams RTNETLINK link events into ch until ctx is canceled.
+// Errors trigger a reconnect after a short backoff.
+func watchLinks(ctx context.Context, ch chan<- linkEvent) {
+	for {
+		err := watchLinksOnce(ctx, ch)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("netlink watcher: %v; reconnecting in 1s", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func watchLinksOnce(ctx context.Context, ch chan<- linkEvent) error {
+	// RTMGRP_LINK isn't exported by the syscall package; the kernel value
+	// has been 1 forever (include/uapi/linux/rtnetlink.h).
+	const rtmgrpLink = 1
+	conn, err := rtnetlink.Dial(&netlink.Config{Groups: rtmgrpLink})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// Closing the conn from another goroutine unblocks Receive() so we
+	// can return on context cancel.
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+	for {
+		msgs, _, err := conn.Receive()
+		if err != nil {
+			return err
+		}
+		for _, m := range msgs {
+			lm, ok := m.(*rtnetlink.LinkMessage)
+			if !ok || lm.Attributes == nil || lm.Attributes.Name == "" {
+				continue
+			}
+			const iffLowerUp = 1 << 16 // include/uapi/linux/if.h
+			ev := linkEvent{
+				name: lm.Attributes.Name,
+				up:   lm.Flags&iffLowerUp != 0,
+			}
+			select {
+			case ch <- ev:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
 }
 
 // runIPCmd runs `ip <args>` and treats the well-known idempotency errors
