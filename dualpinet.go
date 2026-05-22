@@ -2,17 +2,17 @@
 // a wireless interface on the same LAN, moving it to whichever currently
 // reaches the upstream router.
 //
-// The router is discovered dynamically via IPv6 Router Advertisements
-// (nothing about the router is hardcoded except its IPv4 address, which is
-// the one piece of v4 state RAs don't carry). Health checks are ICMPv6
-// pings to the router's link-local address, but only on the wired interface,
-// so the wifi radio isn't burning air time when it isn't carrying traffic.
+// Health checks are ARP requests to the router IPv4 on the wired
+// interface. Only the wired side is probed, so the wifi radio isn't
+// burning air time when it isn't carrying traffic. ARP fires as soon as
+// the kernel marks IFF_LOWER_UP and doesn't wait for IPv6 DAD/RA, so
+// failback after a cable reconnect is sub-second.
 //
 // In addition to the periodic probe, dualpinet subscribes to RTNETLINK
 // link notifications and reacts immediately to carrier changes on the
 // wired interface: loss of carrier fails over to wifi at once, and a
 // fresh carrier triggers a fast-probe window that returns to the wired
-// path on the first successful ping rather than waiting for the slow
+// path on the first successful probe rather than waiting for the slow
 // success streak.
 //
 // Usage:
@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/jsimonetti/rtnetlink"
+	"github.com/mdlayher/arp"
 	"github.com/mdlayher/netlink"
 )
 
@@ -290,13 +291,6 @@ func (c *controller) tick(ctx context.Context) {
 	state, detail := c.probePrimary(ctx)
 
 	switch state {
-	case probeWaiting:
-		// No RA on the primary yet. Don't flap to secondary on that alone
-		// but if the link is *down*, probePrimary returns probeDead instead.
-		if c.current == "" {
-			log.Printf("waiting for RA on %s ...", c.primary.Name)
-		}
-		return
 	case probeAlive:
 		c.goodStreak++
 		c.badStreak = 0
@@ -340,13 +334,13 @@ func (c *controller) tick(ctx context.Context) {
 type probeState int
 
 const (
-	probeWaiting probeState = iota // link up, no RA yet — verdict deferred
-	probeAlive
+	probeAlive probeState = iota
 	probeDead
 )
 
-// probePrimary returns the current health of the primary interface.
-// detail is a short human string for logs.
+// probePrimary returns the current health of the primary interface, judged
+// by carrier + a single ARP request to the configured router. ARP doesn't
+// depend on IPv6 DAD/RA, so this works immediately after carrier comes up.
 func (c *controller) probePrimary(ctx context.Context) (probeState, string) {
 	up, err := hasCarrier(c.primary.Name)
 	if err != nil {
@@ -355,21 +349,27 @@ func (c *controller) probePrimary(ctx context.Context) (probeState, string) {
 	if !up {
 		return probeDead, "no carrier"
 	}
-	routerLL, err := upstreamRouterV6(c.primary.Name)
+	client, err := arp.Dial(c.primary)
 	if err != nil {
-		return probeDead, "route read: " + err.Error()
+		return probeDead, "arp dial: " + err.Error()
 	}
-	if routerLL == "" {
-		return probeWaiting, "no RA yet"
+	defer client.Close()
+	deadline := time.Now().Add(probeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
 	}
-	if err := ping6(ctx, c.primary.Name, routerLL); err != nil {
-		return probeDead, "no reply from " + routerLL
+	if err := client.SetReadDeadline(deadline); err != nil {
+		return probeDead, "set deadline: " + err.Error()
 	}
-	return probeAlive, "router " + routerLL
+	mac, err := client.Resolve(c.router)
+	if err != nil {
+		return probeDead, fmt.Sprintf("arp %s: %v", c.router, err)
+	}
+	return probeAlive, fmt.Sprintf("router %s at %s", c.router, mac)
 }
 
 func (c *controller) apply(iface string) error {
-	// Remove from both interfaces first (idempotent — error on absent is
+	// Remove from both interfaces first (idempotent: error on absent is
 	// treated as success). Avoids the kernel briefly holding the address
 	// on two interfaces, which would confuse ARP and rp_filter.
 	for _, ifi := range []*net.Interface{c.primary, c.secondary} {
@@ -382,37 +382,6 @@ func (c *controller) apply(iface string) error {
 		return fmt.Errorf("route replace: %w", err)
 	}
 	return nil
-}
-
-// upstreamRouterV6 returns the link-local IPv6 of the default router seen
-// on iface, as learned from received Router Advertisements. Returns "" if
-// no RA has been received (or the route has expired).
-func upstreamRouterV6(iface string) (string, error) {
-	out, err := exec.Command("ip", "-6", "route", "show", "default", "dev", iface).Output()
-	if err != nil {
-		return "", err
-	}
-	// "default via fe80::xxx proto ra metric 1024 expires Nsec hoplimit 64 pref medium"
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		for i, w := range fields {
-			if w == "via" && i+1 < len(fields) {
-				return fields[i+1], nil
-			}
-		}
-	}
-	return "", nil
-}
-
-func ping6(ctx context.Context, iface, addr string) error {
-	ctx, cancel := context.WithTimeout(ctx, probeTimeout+500*time.Millisecond)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ping", "-6",
-		"-c", "1",
-		"-W", fmt.Sprintf("%d", int(probeTimeout.Seconds())),
-		"-I", iface,
-		addr)
-	return cmd.Run()
 }
 
 func bringUp(iface string) error {
